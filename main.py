@@ -239,8 +239,17 @@ async def client_reply(rid:int,text:str=Form(default=""),attachment:UploadFile|N
 
 @router.message(CommandStart())
 async def start(m:Message):
-    btn=web_button(); rows=[[btn]] if btn else []
-    await m.answer("⚡ <b>S2Pay</b>\n\nUse the button below to open the form.",reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None)
+    u=(MINI_APP_URL or "").strip().rstrip("/")
+    if not u:
+        return await m.answer("❌ MINI_APP_URL is not configured.")
+    if m.chat.type == "private":
+        btn=InlineKeyboardButton(text="🚀 Open S2Pay",web_app=WebAppInfo(url=u))
+    else:
+        btn=InlineKeyboardButton(text="🚀 Open S2Pay",url=u)
+    await m.answer(
+        "⚡ <b>S2Pay</b>\n\nUse the button below to open the form.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[btn]])
+    )
 
 @router.message(Command("formsettings"))
 async def formsettings(m:Message):
