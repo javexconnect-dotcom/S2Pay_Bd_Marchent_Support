@@ -179,6 +179,15 @@ def web_button(url=None,text="🚀 Open S2Pay",use_webapp=True):
     if use_webapp and u.startswith("https://"): return InlineKeyboardButton(text=text,web_app=WebAppInfo(url=u))
     return InlineKeyboardButton(text=text,url=u)
 
+def client_reply_kb(rid):
+    u=(MINI_APP_URL or "").strip().rstrip("/")
+    if not u or not u.startswith("https://"): return None
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Reply to Buyer",web_app=WebAppInfo(url=f"{u}/?request={int(rid)}"))]])
+
+async def send_client_update(client_id, rid, title, text, reply=True):
+    kb=client_reply_kb(rid) if reply else None
+    await bot.send_message(int(client_id),f"{title} — Request #{int(rid):04d}\n\n{text}",reply_markup=kb)
+
 async def send_buyer_card(rid):
     r=get_request(rid); target=int(r["buyer_group_id"]); kb=buyer_kb(rid,r["status"])
     if r["screenshot_path"] and Path(r["screenshot_path"]).exists(): msg=await bot.send_photo(target,FSInputFile(r["screenshot_path"]),caption=card(r),reply_markup=kb)
@@ -263,6 +272,12 @@ async def create_request(values:str=Form(...),access_pin:str=Form(default=""),me
         c=db(); c.execute("UPDATE requests SET status='FAILED',updated_at=? WHERE id=?",(now(),rid)); c.commit(); c.close(); raise HTTPException(502,"Could not deliver request to Buyer Group")
     return {"ok":True,"request_id":rid}
 
+@app.get("/api/my-requests")
+async def my_requests(authorization:str=Header(default="")):
+    user=auth(authorization)
+    c=db(); rows=c.execute("SELECT id,status,message,created_at,updated_at FROM requests WHERE client_id=? ORDER BY id DESC LIMIT 50",(int(user["id"]),)).fetchall(); c.close()
+    return {"requests":[dict(r) for r in rows]}
+
 @app.post("/api/reply/{rid}")
 async def client_reply(rid:int,text:str=Form(default=""),attachment:UploadFile|None=File(default=None),authorization:str=Header(default="")):
     user=auth(authorization); r=get_request(rid)
@@ -280,9 +295,19 @@ async def client_reply(rid:int,text:str=Form(default=""),attachment:UploadFile|N
 async def start(m:Message):
     u=MINI_APP_URL
     if not u: return await m.answer("❌ MINI_APP_URL is not configured.")
-    if m.chat.type=="private": btn=InlineKeyboardButton(text="🚀 Open S2Pay",web_app=WebAppInfo(url=u))
-    else: btn=InlineKeyboardButton(text="🚀 Open S2Pay",url=u)
-    await m.answer("⚡ <b>S2Pay</b>\n\nUse the button below to open the form.",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[btn]]))
+    if m.chat.type=="private":
+        btn=InlineKeyboardButton(text="🚀 Open S2Pay",web_app=WebAppInfo(url=u))
+        text="⚡ <b>S2Pay</b>\n\nOpen the form below. Your Telegram account will be connected automatically."
+    else:
+        me=await bot.get_me()
+        username=me.username or ""
+        if username:
+            btn=InlineKeyboardButton(text="💬 Open S2Pay Bot",url=f"https://t.me/{username}")
+            text="⚡ <b>S2Pay</b>\n\nFor the Client form, open the bot in private chat and tap <b>🚀 Open S2Pay</b>."
+        else:
+            btn=InlineKeyboardButton(text="🚀 Open S2Pay",url=u)
+            text="⚡ <b>S2Pay</b>\n\nOpen S2Pay from the bot's private chat."
+    await m.answer(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[btn]]))
 
 @router.message(Command("admin"))
 async def admin_cmd(m:Message):
@@ -312,13 +337,13 @@ async def ensure_buyer(q):
 async def apps(q:CallbackQuery):
     r=await ensure_buyer(q)
     if not r:return
-    await q.answer("APP"); await bot.send_message(int(r["client_id"]),f"📱 <b>Buyer update — Request #{r['id']:04d}</b>\n\nBuyer is checking the app."); save_interaction(r["id"],q.from_user.id,"BUYER","APPS","APP")
+    await q.answer("APP"); await send_client_update(r["client_id"],r["id"],"📱 <b>Buyer update</b>","Buyer is checking the app.",True); save_interaction(r["id"],q.from_user.id,"BUYER","APPS","APP")
 
 @router.callback_query(F.data.startswith("otp:"))
 async def otp(q:CallbackQuery):
     r=await ensure_buyer(q)
     if not r:return
-    await q.answer("OtpV"); await bot.send_message(int(r["client_id"]),f"🔐 <b>Buyer update — Request #{r['id']:04d}</b>\n\nBuyer is requesting OTP verification."); save_interaction(r["id"],q.from_user.id,"BUYER","OTP","OtpV")
+    await q.answer("OtpV"); await send_client_update(r["client_id"],r["id"],"🔐 <b>Buyer update</b>","Buyer is requesting OTP verification.",True); save_interaction(r["id"],q.from_user.id,"BUYER","OTP","OtpV")
 
 @router.callback_query(F.data.startswith("view:"))
 async def view(q:CallbackQuery):
@@ -336,7 +361,7 @@ async def finish(q,status):
     rid=int(q.data.split(":")[1]); r=get_request(rid)
     if not r or int(r["buyer_group_id"])!=q.message.chat.id or r["status"]!="PROCESSING": return await q.answer("Request unavailable.",show_alert=True)
     c=db(); c.execute("UPDATE requests SET status=?,updated_at=? WHERE id=?",(status,now(),rid)); c.commit(); c.close()
-    await q.answer(); await q.message.edit_reply_markup(reply_markup=buyer_kb(rid,status)); await bot.send_message(int(r["client_id"]),f"{status_emoji(status)} <b>Request #{rid:04d}</b>\n\nFinal status: <b>{status}</b>"); save_interaction(rid,q.from_user.id,"BUYER","STATUS",status)
+    await q.answer(); await q.message.edit_reply_markup(reply_markup=buyer_kb(rid,status)); await send_client_update(r["client_id"],rid,f"{status_emoji(status)} <b>Final status</b>",f"Request result: <b>{status}</b>",False); save_interaction(rid,q.from_user.id,"BUYER","STATUS",status)
 
 @router.message(F.reply_to_message)
 async def buyer_reply(m:Message):
@@ -350,7 +375,7 @@ async def buyer_reply(m:Message):
     if not r or int(r["buyer_group_id"])!=m.chat.id or r["status"]!="PROCESSING":return
     text=(m.text or m.caption or "").strip()
     if not text:return
-    await bot.send_message(int(r["client_id"]),f"💬 <b>Buyer Message — Request #{rid:04d}</b>\n\n{esc(text)}"); save_interaction(rid,m.from_user.id,"BUYER","MESSAGE",text); await m.reply("✅ Sent to client.")
+    await send_client_update(r["client_id"],rid,"💬 <b>Buyer Message</b>",esc(text),True); save_interaction(rid,m.from_user.id,"BUYER","MESSAGE",text); await m.reply("✅ Sent to client.")
 
 @app.get("/api/buyer/requests")
 async def buyer_requests(authorization:str=Header(default="")):
@@ -365,7 +390,7 @@ async def buyer_message(request_id:int=Form(...),message:str=Form(...),authoriza
     if not buyer_id or not r or int(r["buyer_group_id"])!=int(buyer_id): raise HTTPException(404,"Request not found")
     text=message.strip()
     if not text: raise HTTPException(400,"Message is empty")
-    await bot.send_message(int(r["client_id"]),f"💬 <b>Buyer Message — Request #{request_id:04d}</b>\n\n{esc(text)}"); save_interaction(request_id,int(u["id"]),"BUYER","MESSAGE",text); return {"ok":True}
+    await send_client_update(r["client_id"],request_id,"💬 <b>Buyer Message</b>",esc(text),True); save_interaction(request_id,int(u["id"]),"BUYER","MESSAGE",text); return {"ok":True}
 
 @app.post("/api/buyer/action")
 async def buyer_action(request_id:int=Form(...),action:str=Form(...),authorization:str=Header(default="")):
@@ -375,9 +400,9 @@ async def buyer_action(request_id:int=Form(...),action:str=Form(...),authorizati
     if action not in {"APP","OTPV","SUCCESS","FAILED"}: raise HTTPException(400,"Invalid action")
     if action in {"SUCCESS","FAILED"}:
         if r["status"]!="PROCESSING": return {"ok":True,"status":r["status"]}
-        c=db(); c.execute("UPDATE requests SET status=?,updated_at=? WHERE id=?",(action,now(),request_id)); c.commit(); c.close(); await bot.send_message(int(r["client_id"]),f"{status_emoji(action)} <b>Request #{request_id:04d}</b>\n\nFinal status: <b>{action}</b>"); save_interaction(request_id,int(u["id"]),"BUYER","STATUS",action)
+        c=db(); c.execute("UPDATE requests SET status=?,updated_at=? WHERE id=?",(action,now(),request_id)); c.commit(); c.close(); await send_client_update(r["client_id"],request_id,f"{status_emoji(action)} <b>Final status</b>",f"Request result: <b>{action}</b>",False); save_interaction(request_id,int(u["id"]),"BUYER","STATUS",action)
     else:
-        text="Buyer is checking the app." if action=="APP" else "Buyer is requesting OTP verification."; await bot.send_message(int(r["client_id"]),f"🔔 <b>Buyer update — Request #{request_id:04d}</b>\n\n{esc(text)}"); save_interaction(request_id,int(u["id"]),"BUYER",action,action)
+        text="Buyer is checking the app." if action=="APP" else "Buyer is requesting OTP verification."; await send_client_update(r["client_id"],request_id,"🔔 <b>Buyer update</b>",esc(text),True); save_interaction(request_id,int(u["id"]),"BUYER",action,action)
     return {"ok":True,"status":get_request(request_id)["status"]}
 
 async def bot_main():
