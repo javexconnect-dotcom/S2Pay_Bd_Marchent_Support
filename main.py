@@ -1,4 +1,5 @@
-import asyncio, hashlib, hmac, html, json, os, secrets, sqlite3, time
+import asyncio, hashlib, hmac, html, json, os, re, secrets, sqlite3, time
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from urllib.parse import parse_qsl
 
@@ -62,6 +63,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS field_options(id INTEGER PRIMARY KEY AUTOINCREMENT,field_id TEXT NOT NULL,label TEXT NOT NULL,value TEXT NOT NULL,color TEXT NOT NULL DEFAULT '#64748b',sort_order INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY AUTOINCREMENT,client_id INTEGER NOT NULL,client_name TEXT,client_group_id INTEGER NOT NULL,buyer_group_id INTEGER NOT NULL,project_name TEXT NOT NULL DEFAULT '',operator TEXT NOT NULL DEFAULT '',account_type TEXT NOT NULL DEFAULT '',account TEXT NOT NULL DEFAULT '',monthly_limit TEXT NOT NULL DEFAULT '',daily_cash_in TEXT NOT NULL DEFAULT '',daily_cash_out TEXT NOT NULL DEFAULT '',open_time TEXT NOT NULL DEFAULT '',transaction_per_minute TEXT NOT NULL DEFAULT '',access_pin TEXT NOT NULL DEFAULT '',message TEXT NOT NULL DEFAULT '',field_values TEXT NOT NULL DEFAULT '{}',screenshot_path TEXT,status TEXT NOT NULL DEFAULT 'PROCESSING',buyer_message_id INTEGER,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS interactions(id INTEGER PRIMARY KEY AUTOINCREMENT,request_id INTEGER NOT NULL,sender_id INTEGER NOT NULL,sender_role TEXT NOT NULL,kind TEXT NOT NULL,text TEXT,file_path TEXT,created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS clients(id INTEGER PRIMARY KEY AUTOINCREMENT,telegram_user_id INTEGER UNIQUE NOT NULL,name TEXT NOT NULL DEFAULT '',phone_number TEXT NOT NULL DEFAULT '',personal_group_id INTEGER NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
     """)
     ts = now()
     for fid, label, typ, enabled, order in DEFAULT_FIELDS:
@@ -154,6 +156,18 @@ async def save_upload(upload,prefix,rid=None):
 def get_request(rid):
     c=db(); r=c.execute("SELECT * FROM requests WHERE id=?",(rid,)).fetchone(); c.close(); return r
 
+def get_client_profile(telegram_user_id):
+    c=db(); r=c.execute("SELECT * FROM clients WHERE telegram_user_id=? AND enabled=1",(int(telegram_user_id),)).fetchone(); c.close(); return r
+
+def find_personal_group(r):
+    # Prefer explicit Telegram-user mapping; fall back to the registered account/number.
+    c=db(); row=c.execute("SELECT * FROM clients WHERE telegram_user_id=? AND enabled=1",(int(r['client_id']),)).fetchone()
+    if not row:
+        account=str(r['account'] or '').strip()
+        if account:
+            row=c.execute("SELECT * FROM clients WHERE phone_number=? AND enabled=1 ORDER BY id DESC LIMIT 1",(account,)).fetchone()
+    c.close(); return row
+
 def save_interaction(rid,sender,role,kind,text="",file_path=None):
     c=db(); c.execute("INSERT INTO interactions(request_id,sender_id,sender_role,kind,text,file_path,created_at) VALUES(?,?,?,?,?,?,?)",(rid,sender,role,kind,text,file_path,now())); c.commit(); c.close()
 
@@ -185,8 +199,8 @@ def client_reply_kb(rid):
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Reply to Buyer",web_app=WebAppInfo(url=f"{u}/?request={int(rid)}"))]])
 
 async def send_client_update(client_id, rid, title, text, reply=True):
-    kb=client_reply_kb(rid) if reply else None
-    await bot.send_message(int(client_id),f"{title} — Request #{int(rid):04d}\n\n{text}",reply_markup=kb)
+    # In-app communication: persist the Buyer/System message for the Client Mini App.
+    save_interaction(rid, int(client_id), "BUYER", "MESSAGE", re.sub(r"<[^>]+>", "", text))
 
 async def send_buyer_card(rid):
     r=get_request(rid); target=int(r["buyer_group_id"]); kb=buyer_kb(rid,r["status"])
@@ -249,6 +263,22 @@ async def save_admin_settings(client_group_id:str=Form(default=""),buyer_group_i
     else: set_setting("active_buyer_group","")
     return {"ok":True,"client_group_id":client,"buyer_group_id":buyer}
 
+@app.get("/api/admin/clients")
+async def admin_clients(authorization:str=Header(default="")):
+    admin_auth(authorization); c=db(); rows=c.execute("SELECT * FROM clients ORDER BY id DESC").fetchall(); c.close()
+    return {"clients":[dict(r) for r in rows]}
+
+@app.post("/api/admin/clients")
+async def save_client(telegram_user_id:str=Form(...),name:str=Form(default=""),phone_number:str=Form(default=""),personal_group_id:str=Form(...),enabled:str=Form(default="1"),authorization:str=Header(default="")):
+    admin_auth(authorization)
+    try: uid=int(telegram_user_id.strip()); gid=int(personal_group_id.strip())
+    except ValueError: raise HTTPException(400,"Telegram User ID and Personal Group ID must be numeric")
+    c=db(); ts=now(); c.execute("INSERT INTO clients(telegram_user_id,name,phone_number,personal_group_id,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(telegram_user_id) DO UPDATE SET name=excluded.name,phone_number=excluded.phone_number,personal_group_id=excluded.personal_group_id,enabled=excluded.enabled,updated_at=excluded.updated_at",(uid,name.strip(),phone_number.strip(),gid,int(enabled in {"1","true","True"}),ts,ts)); c.commit(); c.close(); return {"ok":True}
+
+@app.delete("/api/admin/clients/{client_id}")
+async def delete_client(client_id:int,authorization:str=Header(default="")):
+    admin_auth(authorization); c=db(); c.execute("DELETE FROM clients WHERE id=?",(client_id,)); c.commit(); c.close(); return {"ok":True}
+
 @app.get("/api/admin/requests")
 async def admin_requests(authorization:str=Header(default="")):
     admin_auth(authorization); c=db(); rows=c.execute("SELECT * FROM requests ORDER BY id DESC LIMIT 100").fetchall(); c.close()
@@ -267,6 +297,7 @@ async def create_request(values:str=Form(...),access_pin:str=Form(default=""),me
     path=await save_upload(screenshot,"request")
     name=((user.get("first_name") or "")+" "+(user.get("last_name") or "")).strip() or str(user["id"])
     c=db(); cur=c.execute("INSERT INTO requests(client_id,client_name,client_group_id,buyer_group_id,project_name,operator,account_type,account,monthly_limit,daily_cash_in,daily_cash_out,open_time,transaction_per_minute,access_pin,message,field_values,screenshot_path,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(int(user["id"]),name,active_client,active_buyer,str(vals.get("project_name","")),str(vals.get("operator","")),str(vals.get("account_type","")),str(vals.get("account","")),str(vals.get("monthly_limit","")),str(vals.get("daily_cash_in","")),str(vals.get("daily_cash_out","")),str(vals.get("open_time","")),str(vals.get("transaction_per_minute","")),access_pin.strip(),message.strip(),json.dumps(vals,ensure_ascii=False),path,now(),now())); rid=cur.lastrowid; c.commit(); c.close()
+    save_interaction(rid,int(user["id"]),"CLIENT","MESSAGE",message.strip() or "Request submitted.",path)
     try: await send_buyer_card(rid)
     except Exception:
         c=db(); c.execute("UPDATE requests SET status='FAILED',updated_at=? WHERE id=?",(now(),rid)); c.commit(); c.close(); raise HTTPException(502,"Could not deliver request to Buyer Group")
@@ -278,6 +309,30 @@ async def my_requests(authorization:str=Header(default="")):
     c=db(); rows=c.execute("SELECT id,status,message,created_at,updated_at FROM requests WHERE client_id=? ORDER BY id DESC LIMIT 50",(int(user["id"]),)).fetchall(); c.close()
     return {"requests":[dict(r) for r in rows]}
 
+@app.get("/api/interactions/{iid}/attachment")
+async def interaction_attachment(iid:int,authorization:str=Header(default="")):
+    user=auth(authorization); c=db(); row=c.execute("SELECT i.file_path,r.client_id FROM interactions i JOIN requests r ON r.id=i.request_id WHERE i.id=?",(iid,)).fetchone(); c.close()
+    if not row or int(row["client_id"])!=int(user["id"]) or not row["file_path"] or not Path(row["file_path"]).exists(): raise HTTPException(404,"Attachment not found")
+    return FileResponse(row["file_path"])
+
+@app.get("/api/requests/{rid}/messages")
+async def request_messages(rid:int,authorization:str=Header(default="")):
+    user=auth(authorization); r=get_request(rid)
+    if not r or int(r["client_id"])!=int(user["id"]): raise HTTPException(404,"Request not found")
+    c=db(); rows=c.execute("SELECT id,sender_id,sender_role,kind,text,file_path,created_at FROM interactions WHERE request_id=? ORDER BY id ASC",(rid,)).fetchall(); c.close()
+    return {"request_id":rid,"status":r["status"],"messages":[dict(x) for x in rows]}
+
+@app.post("/api/requests/{rid}/message")
+async def client_message(rid:int,text:str=Form(default=""),attachment:UploadFile|None=File(default=None),authorization:str=Header(default="")):
+    user=auth(authorization); r=get_request(rid)
+    if not r or int(r["client_id"])!=int(user["id"]): raise HTTPException(404,"Request not found")
+    if r["status"]!="PROCESSING": raise HTTPException(409,"Request is closed")
+    clean=text.strip(); path=await save_upload(attachment,"chat",rid)
+    if not clean and not path: raise HTTPException(422,"Message cannot be empty")
+    save_interaction(rid,int(user["id"]),"CLIENT","MESSAGE",clean,path)
+    # Client messages are stored in-app; no Telegram Buyer-group message is sent.
+    return {"ok":True}
+
 @app.post("/api/reply/{rid}")
 async def client_reply(rid:int,text:str=Form(default=""),attachment:UploadFile|None=File(default=None),authorization:str=Header(default="")):
     user=auth(authorization); r=get_request(rid)
@@ -285,10 +340,7 @@ async def client_reply(rid:int,text:str=Form(default=""),attachment:UploadFile|N
     if r["status"]!="PROCESSING": raise HTTPException(409,"Request is closed")
     clean=text.strip(); path=await save_upload(attachment,"reply",rid)
     if not clean and not path: raise HTTPException(422,"Reply cannot be empty")
-    save_interaction(rid,int(user["id"]),"CLIENT","REPLY",clean,path)
-    body=f"📩 <b>CLIENT RESPONSE — #{rid:04d}</b>\n\n{esc(clean)}"
-    if path: await bot.send_document(int(r["buyer_group_id"]),FSInputFile(path),caption=body)
-    else: await bot.send_message(int(r["buyer_group_id"]),body)
+    save_interaction(rid,int(user["id"]),"CLIENT","MESSAGE",clean,path)
     return {"ok":True}
 
 @router.message(CommandStart())
@@ -340,13 +392,13 @@ async def ensure_buyer(q):
 async def apps(q:CallbackQuery):
     r=await ensure_buyer(q)
     if not r:return
-    await q.answer("APP"); await send_client_update(r["client_id"],r["id"],"📱 <b>Buyer update</b>","Buyer is checking the app.",True); save_interaction(r["id"],q.from_user.id,"BUYER","APPS","APP")
+    await q.answer("APP"); save_interaction(r["id"],q.from_user.id,"BUYER","MESSAGE","Buyer is checking the app.")
 
 @router.callback_query(F.data.startswith("otp:"))
 async def otp(q:CallbackQuery):
     r=await ensure_buyer(q)
     if not r:return
-    await q.answer("OtpV"); await send_client_update(r["client_id"],r["id"],"🔐 <b>Buyer update</b>","Buyer is requesting OTP verification.",True); save_interaction(r["id"],q.from_user.id,"BUYER","OTP","OtpV")
+    await q.answer("OtpV"); save_interaction(r["id"],q.from_user.id,"BUYER","MESSAGE","Buyer is requesting OTP verification.")
 
 @router.callback_query(F.data.startswith("view:"))
 async def view(q:CallbackQuery):
@@ -358,13 +410,39 @@ async def success(q:CallbackQuery): await finish(q,"SUCCESS")
 @router.callback_query(F.data.startswith("failed:"))
 async def failed(q:CallbackQuery): await finish(q,"FAILED")
 
+async def send_success_to_personal_group(rid):
+    r=get_request(rid)
+    if not r: return False
+    profile=find_personal_group(r)
+    if not profile: return False
+    vals=json.loads(r["field_values"] or "{}")
+    lines=["╔════════════════════════════╗","   🟢 <b>S2Pay • SUCCESS</b>","╚════════════════════════════╝",f"🆔 <b>Request:</b> <code>#{rid:04d}</code>",f"👤 <b>Client:</b> {esc(r['client_name'])}"]
+    for f in form_config():
+        if f["enabled"]:
+            v=vals.get(f["id"],""); lines.append(f"• {esc(f['label'])}: <b>{esc(v) if v else '—'}</b>")
+    if r["message"]: lines += ["",f"💬 <b>Message:</b> {esc(r['message'])}"]
+    local=__import__("datetime").datetime.now(ZoneInfo("Asia/Dhaka")).strftime("%d %B %Y, %I:%M:%S %p")
+    lines += ["","━━━━━━━━━━━━━━━━━━━━",f"📅 <b>Date:</b> {esc(local.split(',')[0])}",f"🕐 <b>Time:</b> {esc(','.join(local.split(',')[1:]).strip())}","🟢 <b>Status:</b> SUCCESS"]
+    target=int(profile["personal_group_id"])
+    try:
+        if r["screenshot_path"] and Path(r["screenshot_path"]).exists():
+            await bot.send_photo(target,FSInputFile(r["screenshot_path"]),caption="\n".join(lines))
+        else:
+            await bot.send_message(target,"\n".join(lines))
+        return True
+    except Exception:
+        return False
+
 async def finish(q,status):
     buyer_id=active_groups()[1]
     if not buyer_id or int(q.message.chat.id)!=int(buyer_id): return await q.answer("Buyer Group only.",show_alert=True)
     rid=int(q.data.split(":")[1]); r=get_request(rid)
     if not r or int(r["buyer_group_id"])!=q.message.chat.id or r["status"]!="PROCESSING": return await q.answer("Request unavailable.",show_alert=True)
     c=db(); c.execute("UPDATE requests SET status=?,updated_at=? WHERE id=?",(status,now(),rid)); c.commit(); c.close()
-    await q.answer(); await q.message.edit_reply_markup(reply_markup=buyer_kb(rid,status)); await send_client_update(r["client_id"],rid,f"{status_emoji(status)} <b>Final status</b>",f"Request result: <b>{status}</b>",False); save_interaction(rid,q.from_user.id,"BUYER","STATUS",status)
+    await q.answer(); await q.message.edit_reply_markup(reply_markup=buyer_kb(rid,status)); save_interaction(rid,q.from_user.id,"BUYER","STATUS",status)
+    save_interaction(rid,int(r["client_id"]),"SYSTEM","STATUS",status)
+    if status=="SUCCESS":
+        await send_success_to_personal_group(rid)
 
 @router.message(F.reply_to_message)
 async def buyer_reply(m:Message):
@@ -378,7 +456,7 @@ async def buyer_reply(m:Message):
     if not r or int(r["buyer_group_id"])!=m.chat.id or r["status"]!="PROCESSING":return
     text=(m.text or m.caption or "").strip()
     if not text:return
-    await send_client_update(r["client_id"],rid,"💬 <b>Buyer Message</b>",esc(text),True); save_interaction(rid,m.from_user.id,"BUYER","MESSAGE",text); await m.reply("✅ Sent to client.")
+    save_interaction(rid,m.from_user.id,"BUYER","MESSAGE",text); await m.reply("✅ Sent to client app.")
 
 @app.get("/api/buyer/requests")
 async def buyer_requests(authorization:str=Header(default="")):
@@ -393,7 +471,7 @@ async def buyer_message(request_id:int=Form(...),message:str=Form(...),authoriza
     if not buyer_id or not r or int(r["buyer_group_id"])!=int(buyer_id): raise HTTPException(404,"Request not found")
     text=message.strip()
     if not text: raise HTTPException(400,"Message is empty")
-    await send_client_update(r["client_id"],request_id,"💬 <b>Buyer Message</b>",esc(text),True); save_interaction(request_id,int(u["id"]),"BUYER","MESSAGE",text); return {"ok":True}
+    save_interaction(request_id,int(u["id"]),"BUYER","MESSAGE",text); return {"ok":True}
 
 @app.post("/api/buyer/action")
 async def buyer_action(request_id:int=Form(...),action:str=Form(...),authorization:str=Header(default="")):
@@ -403,9 +481,11 @@ async def buyer_action(request_id:int=Form(...),action:str=Form(...),authorizati
     if action not in {"APP","OTPV","SUCCESS","FAILED"}: raise HTTPException(400,"Invalid action")
     if action in {"SUCCESS","FAILED"}:
         if r["status"]!="PROCESSING": return {"ok":True,"status":r["status"]}
-        c=db(); c.execute("UPDATE requests SET status=?,updated_at=? WHERE id=?",(action,now(),request_id)); c.commit(); c.close(); await send_client_update(r["client_id"],request_id,f"{status_emoji(action)} <b>Final status</b>",f"Request result: <b>{action}</b>",False); save_interaction(request_id,int(u["id"]),"BUYER","STATUS",action)
+        c=db(); c.execute("UPDATE requests SET status=?,updated_at=? WHERE id=?",(action,now(),request_id)); c.commit(); c.close(); save_interaction(request_id,int(u["id"]),"BUYER","STATUS",action)
+        save_interaction(request_id,int(r["client_id"]),"SYSTEM","STATUS",action)
+        if action=="SUCCESS": await send_success_to_personal_group(request_id)
     else:
-        text="Buyer is checking the app." if action=="APP" else "Buyer is requesting OTP verification."; await send_client_update(r["client_id"],request_id,"🔔 <b>Buyer update</b>",esc(text),True); save_interaction(request_id,int(u["id"]),"BUYER",action,action)
+        text="Buyer is checking the app." if action=="APP" else "Buyer is requesting OTP verification."; save_interaction(request_id,int(u["id"]),"BUYER","MESSAGE",text)
     return {"ok":True,"status":get_request(request_id)["status"]}
 
 async def bot_main():
