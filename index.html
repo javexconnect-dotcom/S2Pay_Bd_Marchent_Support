@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>S2Pay Request Desk</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    :root{font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    body{margin:0;background:#0b1220;color:#f8fafc}
+    .wrap{max-width:680px;margin:auto;padding:22px}
+    .card{background:#111b2e;border:1px solid #24324a;border-radius:18px;padding:20px;box-shadow:0 14px 35px #0005}
+    h1{margin:0 0 6px;font-size:24px}.muted{color:#9fb0c8;font-size:13px;margin-bottom:20px}
+    label{display:block;font-size:13px;color:#b8c6da;margin:14px 0 6px}
+    input{width:100%;box-sizing:border-box;background:#0c1527;color:#fff;border:1px solid #2a3a56;border-radius:11px;padding:12px;font-size:15px;outline:none}
+    input:focus{border-color:#5aa9ff}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    button{width:100%;border:0;border-radius:12px;padding:13px;background:#2588ff;color:#fff;font-weight:700;font-size:15px;margin-top:18px}
+    .danger{background:#7f1d1d}.status{margin-top:15px;min-height:22px;color:#b9d7ff}
+    @media(max-width:520px){.grid{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>⚡ S2Pay</h1>
+    <div class="muted">Client Request Desk</div>
+    <form id="form">
+      <label>Project Name</label><input name="project_name" placeholder="BK Personal" required>
+      <div class="grid">
+        <div><label>Operator</label><input name="operator" required></div>
+        <div><label>Account Type</label><input name="account_type" required></div>
+      </div>
+      <label>Account</label><input name="account" required>
+      <div class="grid">
+        <div><label>Monthly Limit</label><input name="monthly_limit" required></div>
+        <div><label>Open Time</label><input name="open_time" value="24" required></div>
+      </div>
+      <div class="grid">
+        <div><label>Daily Cash In</label><input name="daily_cash_in" required></div>
+        <div><label>Daily Cash Out</label><input name="daily_cash_out" required></div>
+      </div>
+      <label>Transaction Per Minute</label><input name="transaction_per_minute" placeholder="1 to 2" required>
+      <label>Optional Screenshot</label><input name="screenshot" type="file" accept=".jpg,.jpeg,.png,.webp,.pdf">
+      <button type="submit">Submit Request</button>
+      <div id="status" class="status"></div>
+    </form>
+  </div>
+</div>
+<script>
+const tg = window.Telegram?.WebApp;
+tg?.ready(); tg?.expand();
+const form=document.getElementById("form"), status=document.getElementById("status");
+form.addEventListener("submit", async e=>{
+  e.preventDefault();
+  if(!tg?.initData){status.textContent="Open this page from the Telegram bot.";return;}
+  status.textContent="Submitting…";
+  const fd=new FormData(form);
+  const file=form.querySelector('[name="screenshot"]').files[0];
+  if(!file) fd.delete("screenshot");
+  try{
+    const r=await fetch("/api/request",{method:"POST",headers:{Authorization:"tma "+tg.initData},body:fd});
+    const data=await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(data.detail||"Submission failed");
+    status.textContent=`✅ Request #${String(data.request_id).padStart(4,"0")} sent to Buyer.`;
+    form.reset();
+    form.querySelector('[name="open_time"]').value="24";
+  }catch(err){status.textContent="❌ "+err.message}
+});
+</script>
+</body>
+</html>
