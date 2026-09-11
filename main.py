@@ -163,9 +163,13 @@ def buyer_kb(rid,status):
     if status!="PROCESSING": return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📋 View",callback_data=f"view:{rid}")]])
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="APP",callback_data=f"apps:{rid}"),InlineKeyboardButton(text="OtpV",callback_data=f"otp:{rid}")],[InlineKeyboardButton(text="সফল",callback_data=f"success:{rid}"),InlineKeyboardButton(text="অসফল",callback_data=f"failed:{rid}")]])
 
-def web_button(url=None,text="🚀 Open S2Pay"):
-    u=url or MINI_APP_URL
-    return InlineKeyboardButton(text=text,web_app=WebAppInfo(url=u)) if u else None
+def web_button(url=None,text="🚀 Open S2Pay",use_webapp=True):
+    u=(url or MINI_APP_URL or "").strip().rstrip("/")
+    if not u:
+        return None
+    if use_webapp and u.startswith("https://"):
+        return InlineKeyboardButton(text=text,web_app=WebAppInfo(url=u))
+    return InlineKeyboardButton(text=text,url=u)
 
 async def send_buyer_card(rid):
     r=get_request(rid); target=int(r["buyer_group_id"]); kb=buyer_kb(rid,r["status"])
@@ -202,7 +206,7 @@ async def save_form_config(payload:str=Form(...),authorization:str=Header(defaul
     c.commit(); c.close(); return {"ok":True,"fields":form_config()}
 
 @app.post("/api/request")
-async def create_request(values:str=Form(...),access_pin:str=Form(...),message:str=Form(default=""),screenshot:UploadFile|None=File(default=None),authorization:str=Header(default="")):
+async def create_request(values:str=Form(...),access_pin:str=Form(default=""),message:str=Form(default=""),screenshot:UploadFile|None=File(default=None),authorization:str=Header(default="")):
     user=auth(authorization)
     try: vals=json.loads(values)
     except Exception: raise HTTPException(422,"Invalid form data")
@@ -260,11 +264,31 @@ async def role(q:CallbackQuery):
 
 @router.message(Command("useclient"))
 async def useclient(m:Message):
-    if m.from_user.id in ADMIN_IDS and group_config(m.chat.id,"CLIENT"): set_active_pair(client_chat_id=m.chat.id); await m.answer(f"✅ Active Client Group: <code>{m.chat.id}</code>")
+    if m.from_user.id not in ADMIN_IDS:
+        return await m.answer("⛔ Admin only.")
+    if m.chat.type not in {"group","supergroup"}:
+        return await m.answer("Run /useclient inside the Client Group.")
+    if not group_config(m.chat.id,"CLIENT"):
+        return await m.answer(
+            "❌ This group is not configured as Client Group.\\n\\n"
+            "First run /setup here and choose 👤 Client Group."
+        )
+    set_active_pair(client_chat_id=m.chat.id)
+    await m.answer(f"✅ <b>Active Client Group</b>\\n<code>{m.chat.id}</code>")
 
 @router.message(Command("usebuyer"))
 async def usebuyer(m:Message):
-    if m.from_user.id in ADMIN_IDS and group_config(m.chat.id,"BUYER"): set_active_pair(buyer_chat_id=m.chat.id); await m.answer(f"✅ Active Buyer Group: <code>{m.chat.id}</code>")
+    if m.from_user.id not in ADMIN_IDS:
+        return await m.answer("⛔ Admin only.")
+    if m.chat.type not in {"group","supergroup"}:
+        return await m.answer("Run /usebuyer inside the Buyer Group.")
+    if not group_config(m.chat.id,"BUYER"):
+        return await m.answer(
+            "❌ This group is not configured as Buyer Group.\\n\\n"
+            "First run /setup here and choose 🛒 Buyer Group."
+        )
+    set_active_pair(buyer_chat_id=m.chat.id)
+    await m.answer(f"✅ <b>Active Buyer Group</b>\\n<code>{m.chat.id}</code>")
 
 async def ensure_buyer(q):
     if not group_config(q.message.chat.id,"BUYER"): await q.answer("Buyer Group only.",show_alert=True); return None
