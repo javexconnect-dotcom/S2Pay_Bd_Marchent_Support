@@ -302,11 +302,14 @@ async def start(m:Message):
         me=await bot.get_me()
         username=me.username or ""
         if username:
-            btn=InlineKeyboardButton(text="💬 Open S2Pay Bot",url=f"https://t.me/{username}")
-            text="⚡ <b>S2Pay</b>\n\nFor the Client form, open the bot in private chat and tap <b>🚀 Open S2Pay</b>."
+            # Telegram's Main Mini App direct-link format. Unlike a WebApp
+            # inline button, this can be used from group chats and opens the
+            # configured Main Mini App directly when it is enabled in BotFather.
+            btn=InlineKeyboardButton(text="🚀 Open S2Pay",url=f"https://t.me/{username}?startapp")
+            text="⚡ <b>S2Pay</b>\n\nTap <b>🚀 Open S2Pay</b> to launch the Mini App."
         else:
             btn=InlineKeyboardButton(text="🚀 Open S2Pay",url=u)
-            text="⚡ <b>S2Pay</b>\n\nOpen S2Pay from the bot's private chat."
+            text="⚡ <b>S2Pay</b>\n\nOpen S2Pay."
     await m.answer(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[btn]]))
 
 @router.message(Command("admin"))
