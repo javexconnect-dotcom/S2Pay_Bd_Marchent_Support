@@ -67,19 +67,23 @@ def init_db():
     c.executescript("""
     CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS group_configs(chat_id INTEGER PRIMARY KEY,role TEXT NOT NULL,title TEXT,enabled INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS form_fields(id TEXT PRIMARY KEY,label TEXT NOT NULL,field_type TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,required INTEGER NOT NULL DEFAULT 1,sort_order INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS form_fields(id TEXT PRIMARY KEY,label TEXT NOT NULL,field_type TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,required INTEGER NOT NULL DEFAULT 0,sort_order INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS field_options(id INTEGER PRIMARY KEY AUTOINCREMENT,field_id TEXT NOT NULL,label TEXT NOT NULL,value TEXT NOT NULL,color TEXT NOT NULL DEFAULT '#64748b',sort_order INTEGER NOT NULL DEFAULT 0);
-    CREATE TABLE IF NOT EXISTS members(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,pin_hash TEXT NOT NULL UNIQUE,pin_hint TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY AUTOINCREMENT,client_id INTEGER NOT NULL,client_name TEXT,client_group_id INTEGER NOT NULL,buyer_group_id INTEGER NOT NULL,project_name TEXT NOT NULL DEFAULT '',operator TEXT NOT NULL DEFAULT '',account_type TEXT NOT NULL DEFAULT '',account TEXT NOT NULL DEFAULT '',monthly_limit TEXT NOT NULL DEFAULT '',daily_cash_in TEXT NOT NULL DEFAULT '',daily_cash_out TEXT NOT NULL DEFAULT '',open_time TEXT NOT NULL DEFAULT '',transaction_per_minute TEXT NOT NULL DEFAULT '',access_pin TEXT NOT NULL DEFAULT '',message TEXT NOT NULL DEFAULT '',field_values TEXT NOT NULL DEFAULT '{}',screenshot_path TEXT,status TEXT NOT NULL DEFAULT 'PROCESSING',buyer_message_id INTEGER,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS interactions(id INTEGER PRIMARY KEY AUTOINCREMENT,request_id INTEGER NOT NULL,sender_id INTEGER NOT NULL,sender_role TEXT NOT NULL,kind TEXT NOT NULL,text TEXT,file_path TEXT,created_at TEXT NOT NULL);
     """)
     ts = now()
     for fid, label, typ, enabled, order in DEFAULT_FIELDS:
-        c.execute("INSERT OR IGNORE INTO form_fields(id,label,field_type,enabled,required,sort_order,updated_at) VALUES(?,?,?,?,?,?,?)", (fid,label,typ,enabled,1,order,ts))
+        c.execute("INSERT OR IGNORE INTO form_fields(id,label,field_type,enabled,required,sort_order,updated_at) VALUES(?,?,?,?,?,?,?)", (fid,label,typ,enabled,0,order,ts))
     for fid, opts in DEFAULT_OPTIONS.items():
         if c.execute("SELECT COUNT(*) FROM field_options WHERE field_id=?", (fid,)).fetchone()[0] == 0:
             for i,(label,value,color) in enumerate(opts):
                 c.execute("INSERT INTO field_options(field_id,label,value,color,sort_order) VALUES(?,?,?,?,?)", (fid,label,value,color,i))
+    # Final workflow: no field is mandatory by default. Existing default fields are made optional once.
+    if not c.execute("SELECT 1 FROM settings WHERE key=?", ("required_defaults_v2",)).fetchone():
+        c.execute("UPDATE form_fields SET required=0")
+        c.execute("INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)", ("required_defaults_v2", "1", ts))
+
     # Backward-compatible columns for an existing database.
     for col, typ, default in [("access_pin","TEXT","''"),("message","TEXT","''"),("field_values","TEXT","'{}'")]:
         try: c.execute(f"ALTER TABLE requests ADD COLUMN {col} {typ} NOT NULL DEFAULT {default}")
@@ -109,7 +113,6 @@ def set_active_pair(client_chat_id=None,buyer_chat_id=None):
 
 def esc(v): return html.escape(str(v or ""))
 def status_emoji(s): return {"PROCESSING":"🟡","SUCCESS":"🟢","FAILED":"🔴"}.get(s,"⚪")
-def hash_pin(pin): return hashlib.sha256(pin.strip().encode()).hexdigest()
 
 def auth(authorization):
     if not authorization or not authorization.startswith("tma "): raise HTTPException(401,"Open this app from Telegram.")
@@ -158,7 +161,7 @@ def card(r):
 
 def buyer_kb(rid,status):
     if status!="PROCESSING": return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📋 View",callback_data=f"view:{rid}")]])
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📱 Apps",callback_data=f"apps:{rid}"),InlineKeyboardButton(text="💬 Message",callback_data=f"msg:{rid}")],[InlineKeyboardButton(text="📋 View",callback_data=f"view:{rid}"),InlineKeyboardButton(text="✅ Success",callback_data=f"success:{rid}"),InlineKeyboardButton(text="❌ Failed",callback_data=f"failed:{rid}")]])
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="APP",callback_data=f"apps:{rid}"),InlineKeyboardButton(text="OtpV",callback_data=f"otp:{rid}")],[InlineKeyboardButton(text="সফল",callback_data=f"success:{rid}"),InlineKeyboardButton(text="অসফল",callback_data=f"failed:{rid}")]])
 
 def web_button(url=None,text="🚀 Open S2Pay"):
     u=url or MINI_APP_URL
@@ -198,31 +201,12 @@ async def save_form_config(payload:str=Form(...),authorization:str=Header(defaul
             if label2: c.execute("INSERT INTO field_options(field_id,label,value,color,sort_order) VALUES(?,?,?,?,?)",(fid,label2,value,color,j))
     c.commit(); c.close(); return {"ok":True,"fields":form_config()}
 
-@app.post("/api/admin/member")
-async def add_member(name:str=Form(...),pin:str=Form(...),authorization:str=Header(default="")):
-    admin_auth(authorization); name=name.strip(); pin=pin.strip()
-    if not name or len(pin)<4: raise HTTPException(422,"Name and a PIN of at least 4 characters are required")
-    c=db()
-    try: c.execute("INSERT INTO members(name,pin_hash,pin_hint,enabled,created_at) VALUES(?,?,?,?,?)",(name,hash_pin(pin),pin[-2:],1,now())); c.commit()
-    except sqlite3.IntegrityError: raise HTTPException(409,"That PIN already exists")
-    finally: c.close()
-    return {"ok":True}
-
-@app.get("/api/admin/members")
-async def members(authorization:str=Header(default="")):
-    admin_auth(authorization); c=db(); rows=c.execute("SELECT id,name,pin_hint,enabled,created_at FROM members ORDER BY id DESC").fetchall(); c.close(); return [dict(r) for r in rows]
-
-@app.post("/api/admin/member/{mid}/toggle")
-async def toggle_member(mid:int,authorization:str=Header(default="")):
-    admin_auth(authorization); c=db(); c.execute("UPDATE members SET enabled=CASE enabled WHEN 1 THEN 0 ELSE 1 END WHERE id=?",(mid,)); c.commit(); c.close(); return {"ok":True}
-
 @app.post("/api/request")
 async def create_request(values:str=Form(...),access_pin:str=Form(...),message:str=Form(default=""),screenshot:UploadFile|None=File(default=None),authorization:str=Header(default="")):
     user=auth(authorization)
     try: vals=json.loads(values)
     except Exception: raise HTTPException(422,"Invalid form data")
-    pin=access_pin.strip(); c=db(); member=c.execute("SELECT * FROM members WHERE pin_hash=? AND enabled=1",(hash_pin(pin),)).fetchone(); c.close()
-    if not member: raise HTTPException(403,"Invalid or inactive Access PIN")
+    pin=access_pin.strip()
     fields=form_config()
     for f in fields:
         if f["enabled"] and f["required"] and not str(vals.get(f["id"],"")).strip(): raise HTTPException(422,f"{f['label']} is required")
@@ -258,7 +242,7 @@ async def start(m:Message):
 async def formsettings(m:Message):
     if m.from_user.id not in ADMIN_IDS: return
     btn=web_button((MINI_APP_URL+"/admin") if MINI_APP_URL else None,"⚙️ Form Settings")
-    await m.answer("⚙️ <b>S2Pay Form Settings</b>\n\nEnable/disable fields, add fields, edit dropdown options/colors, and manage member Access PINs.",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[btn]]) if btn else None)
+    await m.answer("⚙️ <b>S2Pay Form Settings</b>\n\nEnable/disable fields, add fields, edit dropdown options/colors, and manage your form.",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[btn]]) if btn else None)
 
 @router.message(Command("chatid"))
 async def chatid(m:Message): await m.answer(f"🆔 Chat ID: <code>{m.chat.id}</code>")
@@ -292,7 +276,15 @@ async def ensure_buyer(q):
 async def apps(q:CallbackQuery):
     r=await ensure_buyer(q)
     if not r:return
-    await q.answer(); await q.message.answer(f"📱 <b>Apps — Request #{r['id']:04d}</b>\n\nPlease handle app verification manually."); save_interaction(r["id"],q.from_user.id,"BUYER","APPS","Apps")
+    await q.answer("APP"); await bot.send_message(int(r["client_id"]),f"📱 <b>Buyer update — Request #{r['id']:04d}</b>\n\nBuyer is checking the app."); save_interaction(r["id"],q.from_user.id,"BUYER","APPS","APP")
+
+@router.callback_query(F.data.startswith("otp:"))
+async def otp(q:CallbackQuery):
+    r=await ensure_buyer(q)
+    if not r:return
+    await q.answer("OtpV")
+    await bot.send_message(int(r["client_id"]),f"🔐 <b>Buyer update — Request #{r['id']:04d}</b>\n\nBuyer is requesting OTP verification.")
+    save_interaction(r["id"],q.from_user.id,"BUYER","OTP","OtpV")
 
 @router.callback_query(F.data.startswith("msg:"))
 async def msg_action(q:CallbackQuery):
@@ -328,6 +320,47 @@ async def finish(q,status):
 async def success(q:CallbackQuery): await finish(q,"SUCCESS")
 @router.callback_query(F.data.startswith("failed:"))
 async def failed(q:CallbackQuery): await finish(q,"FAILED")
+
+
+@app.get("/api/buyer/requests")
+async def buyer_requests(authorization: str = Header(default="")):
+    u=auth(authorization)
+    buyer_id=active_groups()[1]
+    if not buyer_id: raise HTTPException(503,"Buyer Group is not configured")
+    # The Buyer Group is the routing target; no separate member approval layer is used.
+    c=db(); rows=c.execute("SELECT * FROM requests WHERE buyer_group_id=? ORDER BY id DESC LIMIT 100",(buyer_id,)).fetchall(); c.close()
+    out=[]
+    for r in rows:
+        out.append({"id":r["id"],"client_name":r["client_name"],"status":r["status"],"access_pin":r["access_pin"],"message":r["message"],"field_values":json.loads(r["field_values"] or "{}"),"created_at":r["created_at"],"screenshot":bool(r["screenshot_path"])})
+    return {"fields":form_config(),"requests":out}
+
+@app.post("/api/buyer/message")
+async def buyer_message(request_id: int = Form(...), message: str = Form(...), authorization: str = Header(default="")):
+    u=auth(authorization); buyer_id=active_groups()[1]
+    r=get_request(request_id)
+    if not buyer_id or not r or int(r["buyer_group_id"])!=int(buyer_id): raise HTTPException(404,"Request not found")
+    text=message.strip()
+    if not text: raise HTTPException(400,"Message is empty")
+    await bot.send_message(int(r["client_id"]),f"💬 <b>Buyer Message — Request #{request_id:04d}</b>\n\n{esc(text)}")
+    save_interaction(request_id,int(u["id"]),"BUYER","MESSAGE",text)
+    return {"ok":True}
+
+@app.post("/api/buyer/action")
+async def buyer_action(request_id: int = Form(...), action: str = Form(...), authorization: str = Header(default="")):
+    u=auth(authorization); buyer_id=active_groups()[1]; r=get_request(request_id)
+    if not buyer_id or not r or int(r["buyer_group_id"])!=int(buyer_id): raise HTTPException(404,"Request not found")
+    action=action.strip().upper()
+    if action not in {"APP","OTPV","SUCCESS","FAILED"}: raise HTTPException(400,"Invalid action")
+    if action in {"SUCCESS","FAILED"}:
+        if r["status"]!="PROCESSING": return {"ok":True,"status":r["status"]}
+        c=db(); c.execute("UPDATE requests SET status=?,updated_at=? WHERE id=?",(action,now(),request_id)); c.commit(); c.close()
+        await bot.send_message(int(r["client_id"]),f"{status_emoji(action)} <b>Request #{request_id:04d}</b>\n\nFinal status: <b>{action}</b>")
+        save_interaction(request_id,int(u["id"]),"BUYER","STATUS",action)
+    else:
+        text="Buyer is checking the app." if action=="APP" else "Buyer is requesting OTP verification."
+        await bot.send_message(int(r["client_id"]),f"🔔 <b>Buyer update — Request #{request_id:04d}</b>\n\n{esc(text)}")
+        save_interaction(request_id,int(u["id"]),"BUYER",action,action)
+    return {"ok":True,"status":get_request(request_id)["status"]}
 
 async def bot_main():
     global bot
